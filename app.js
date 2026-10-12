@@ -1,220 +1,71 @@
-/* Haymani Project Money v2 — local-first, works offline */
-const K = 'haymani_money_v1';           // same key as v1, so existing data is kept
-const EXPENSE_CATS = ['Material','Hardware','Labor','Transport','Installation','Finishing','Outsourcing','CNC-Machine','Fuel','Food-Allowance','Miscellaneous','Refund','Other'];
-const INCOME_CATS  = ['Customer Payment','Refund','Other'];
-const STATUSES     = ['Planned','Active','Completed','Cancelled'];
-const METHODS      = ['Cash','Bank Transfer','Mobile Money','Card','Other'];
-
-const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-const jsArg = v => esc(JSON.stringify(v));          // safe value inside onclick="..."
-const $ = x => document.querySelector(x);
-const money = n => new Intl.NumberFormat('en-US', {maximumFractionDigits: 2}).format(n || 0) + ' Birr';
-const pct = n => (isFinite(n) ? Math.round(n * 1000) / 10 : 0) + '%';
-const today = () => new Date(Date.now() - new Date().getTimezoneOffset() * 6e4).toISOString().slice(0, 10);
-const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
-
-/* ---------- data ---------- */
-function normalize(x) {
-  const out = { projects: [], transactions: [] };
-  (x.projects || []).forEach(p => out.projects.push({
-    id: p.id, customer: p.customer || '', name: p.name || '', quote: p.quote || '',
-    price: +p.price || 0, expectedCost: +p.expectedCost || 0, advance: +p.advance || 0,
-    start: p.start || '', deadline: p.deadline || '', status: p.status || 'Planned', notes: p.notes || ''
-  }));
-  (x.transactions || []).forEach(t => out.transactions.push({
-    uid: t.uid || uid(), projectId: t.projectId, date: t.date || '', amount: +t.amount || 0,
-    category: t.category || '', description: t.description || '', person: t.person || '',
-    method: t.method || '', ref: t.ref || '', by: t.by || '', notes: t.notes || '', type: t.type
-  }));
-  return out;
+const KEY='haymani_money_v2';
+const LISTS=['projects','transactions','dailyTop3','weeklyScorecard','skills','fitness','content','sales','notes'];
+const today=()=>new Date(Date.now()-new Date().getTimezoneOffset()*6e4).toISOString().slice(0,10);
+const newId=()=>Date.now().toString(36)+Math.random().toString(36).slice(2,7);
+function readLS(k){try{return JSON.parse(localStorage.getItem(k)||'null')}catch(e){return null}}
+function fixDb(x){
+  x=(x&&typeof x==='object'&&!Array.isArray(x))?x:{};
+  LISTS.forEach(k=>{if(!Array.isArray(x[k]))x[k]=[]});
+  x.projects.forEach(p=>{
+    // Earlier Project Money tracker: quote = quotation number (text), price = quoted price, expectedCost, advance
+    if(typeof p.quote==='string'){p.quoteNo=p.quoteNo||p.quote;p.quote=+p.price||0}
+    p.quote=+p.quote||0;
+    if(p.expected===undefined)p.expected=+p.expectedCost||0;
+    p.expected=+p.expected||0;
+    if(+p.advance>0&&!p.advanceMigrated&&!x.transactions.some(t=>t.projectId===p.id&&t.isAdvance)){
+      x.transactions.push({id:newId(),date:p.start||today(),projectId:p.id,projectName:p.name,type:'income',category:'Customer Payment',amount:+p.advance,description:'Advance received (from earlier tracker)',paidTo:p.customer||'',method:'Other',isAdvance:true});
+      p.advanceMigrated=true;
+    }
+  });
+  x.transactions.forEach(t=>{
+    if(t.description==='Advance received (from earlier tracker)')t.isAdvance=true;
+    t.id=String(t.id||t.uid||newId());
+    t.amount=+t.amount||0;
+    if(!t.projectName){let p=x.projects.find(p=>p.id===t.projectId);if(p)t.projectName=p.name}
+    if(t.paidTo===undefined)t.paidTo=t.person||'';
+  });
+  return x;
 }
-function load() {
-  try {
-    const x = JSON.parse(localStorage.getItem(K));
-    if (x && Array.isArray(x.projects) && Array.isArray(x.transactions)) return normalize(x);
-  } catch (e) {}
-  return { projects: [], transactions: [] };
+let db=fixDb(readLS(KEY)||readLS('haymani_money_v1'));
+let curLedger=null;
+// The project's Advance is kept as ONE linked income transaction, so cash totals and the ledger always agree.
+function syncAdvance(p){
+  const a=+p.advance||0;let t=db.transactions.find(x=>x.projectId===p.id&&x.isAdvance);
+  if(a>0){
+    p.advanceMigrated=true;
+    if(t){t.amount=a;t.projectName=p.name;t.paidTo=t.paidTo||p.customer||''}
+    else db.transactions.push({id:newId(),date:p.start||today(),projectId:p.id,projectName:p.name,type:'income',category:'Customer Payment',amount:a,description:'Advance received',paidTo:p.customer||'',method:'Other',isAdvance:true});
+  }else if(t)db.transactions=db.transactions.filter(x=>x!==t);
 }
-let d = load();
-let cur = 'home', ledgerId = null;
-
-function save() {
-  try { localStorage.setItem(K, JSON.stringify(d)); }
-  catch (e) { alert('Could not save — phone storage may be full. Export a backup now.'); }
-  page(cur);
-}
-
-const sum = (list) => list.reduce((s, t) => s + t.amount, 0);
-const total = (id, type) => sum(d.transactions.filter(t => t.projectId === id && t.type === type));
-function stats(p) {
-  const spent = total(p.id, 'expense'), paid = total(p.id, 'income');
-  return {
-    spent, paid,
-    expectedProfit: p.price - p.expectedCost,
-    currentProfit: p.price - spent,
-    costPct: p.price ? spent / p.price : 0,
-    balance: p.price - p.advance - paid,       // quoted − advance − later customer payments
-    netCash: p.advance + paid - spent
-  };
-}
-
-/* ---------- pages ---------- */
-function row(t, deletable) {
-  return `<div class="tx"><div><b>${esc(t.description)}</b><small>${esc(t.date)} · ${esc(t.projectId)} · ${esc(t.category)}${t.person ? ' · ' + esc(t.person) : ''}</small>${t.notes ? `<small>${esc(t.notes)}</small>` : ''}${deletable ? `<small><a href="#" onclick="delTx(${jsArg(t.uid)});return false" style="color:#b91c1c">Delete</a></small>` : ''}</div><b class="${t.type}">${t.type === 'income' ? '+' : '−'}${money(t.amount)}</b></div>`;
-}
-
-function page(p) {
-  cur = p;
-  document.querySelectorAll('nav button').forEach(b => b.style.color = b.dataset.p === p ? '#111827' : '');
-  const inc = sum(d.transactions.filter(t => t.type === 'income')), exp = sum(d.transactions.filter(t => t.type === 'expense'));
-  let h = '';
-  if (p === 'home') {
-    h = `<div class="hero"><span>Net Cash Position</span><strong>${money(inc - exp)}</strong></div>
-      <div class="grid"><div class="card"><small>Income</small><b>${money(inc)}</b></div><div class="card"><small>Expenses</small><b>${money(exp)}</b></div></div>
-      <button class="btn" onclick="tx('expense')">＋ Add Expense</button>
-      <button class="secondary" onclick="tx('income')">＋ Customer Payment</button>
-      <h2>Recent</h2>${d.transactions.slice(-8).reverse().map(t => row(t)).join('') || '<p class="muted">No transactions yet.</p>'}`;
+const $=s=>document.querySelector(s),money=n=>new Intl.NumberFormat('en-ET',{maximumFractionDigits:2}).format(Number(n)||0)+' Birr';function save(){try{localStorage.setItem(KEY,JSON.stringify(db))}catch(e){toast('Could not save - storage may be full. Export a backup now.')}}function toast(m){let t=$('#toast');t.textContent=m;t.style.display='block';setTimeout(()=>t.style.display='none',2000)}function esc(v){return String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}function go(s){render(s)}document.querySelectorAll('nav button').forEach(b=>b.onclick=()=>go(b.dataset.screen));let editTxId=null;function render(s='dashboard'){editTxId=null;let el=$('#screen');if(s==='dashboard')el.innerHTML=dashboard();else if(s==='projects')el.innerHTML=projects();else if(s==='add')el.innerHTML=add();else if(s==='plan')el.innerHTML=plan();else if(s==='control')el.innerHTML=control();else if(s==='reports')el.innerHTML=reports();bind(s)}function totals(){let income=db.transactions.filter(x=>x.type==='income').reduce((a,x)=>a+x.amount,0),expense=db.transactions.filter(x=>x.type==='expense').reduce((a,x)=>a+x.amount,0);return{income,expense}}function dashboard(){let t=totals();return `<div class="content"><div class="hero"><div class="small">BUILD THE MAN · BUILD THE BUSINESS · BUILD THE LIFE</div><div class="big">Haymani Command Center</div><div class="small">Your projects, money and annual goals in one place.</div></div><div class="notice">Record every project-related birr on the day it moves. Keep business cash, profit and personal savings separate.</div><div class="cards"><div class="card"><div class="label">Projects</div><div class="value">${db.projects.length}</div></div><div class="card"><div class="label">Money Received</div><div class="value">${money(t.income)}</div></div><div class="card"><div class="label">Money Spent</div><div class="value">${money(t.expense)}</div></div><div class="card"><div class="label">Cash Movement</div><div class="value">${money(t.income-t.expense)}</div></div></div><div class="panel"><h3>Master targets</h3><div class="statline"><span>Personal savings target</span><b>1,500,000 Birr</b></div><div class="statline"><span>Haymani annual net profit target</span><b>2,500,000 Birr</b></div><div class="statline"><span>Body goal</span><b>52 → 65 kg</b></div><button class="btn" data-go="plan">Open Master Plan</button></div><div class="panel"><h3>Quick actions</h3><button class="btn" data-go="add">＋ Add expense or payment</button><button class="btn secondary" data-go="projects">View project control</button><button class="btn secondary" data-go="control">Open management trackers</button><button class="btn secondary" data-go="reports">Reports &amp; CSV export</button></div><div class="panel"><h3>Recent transactions</h3>${recent(5)}</div></div>`}function recent(n){let a=[...db.transactions].sort((x,y)=>(y.date||'').localeCompare(x.date||'')).slice(0,n);return a.length?a.map(x=>`<div class="item"><b class="${x.type}">${x.type==='income'?'+':'−'} ${money(x.amount)}</b><div class="muted">${esc(x.projectName||x.projectId)} · ${esc(x.category)} · ${esc(x.description||'')}</div><div class="muted">${esc(x.date)}</div></div>`).join(''):'<div class="empty">No transactions yet.</div>'}function projects(){return `<div class="content"><h2>Projects</h2><button class="btn" data-go="newproject">＋ New Project</button><div class="panel">${db.projects.length?db.projects.map(p=>{let tx=db.transactions.filter(x=>x.projectId===p.id),i=tx.filter(x=>x.type==='income').reduce((a,x)=>a+x.amount,0),o=tx.filter(x=>x.type==='expense').reduce((a,x)=>a+x.amount,0);return `<div class="item"><h3>${esc(p.name)}</h3><div class="muted">${esc(p.customer)} · ${esc(p.id)}</div>${p.start||p.deadline?`<div class="muted">${p.start?'Start '+esc(p.start):''}${p.start&&p.deadline?' · ':''}${p.deadline?'Due '+esc(p.deadline):''}</div>`:''}${p.notes?`<div class="small">${esc(p.notes)}</div>`:''}<div class="statline"><span>Quoted</span><b>${money(p.quote)}</b></div><div class="statline"><span>Received</span><b class="income">${money(i)}</b></div>${+p.advance>0?`<div class="statline"><span>&nbsp;&nbsp;of which advance</span><b>${money(p.advance)}</b></div>`:''}<div class="statline"><span>Spent</span><b class="expense">${money(o)}</b></div><div class="statline"><span>Est. profit before overhead</span><b>${money((p.quote||0)-o)}</b></div><div class="statline"><span>Customer balance</span><b>${money((p.quote||0)-i)}</b></div><button class="btn secondary" data-ledger="${esc(p.id)}">Open ledger</button><button class="btn secondary" data-edit="${esc(p.id)}">✎ Edit project</button><button class="btn danger" data-delete="${esc(p.id)}">Delete project</button></div>`}).join(''):'<div class="empty">Create a project before entering project expenses.</div>'}</div></div>`}function add(){return `<div class="content"><h2>Record money movement</h2><div class="panel"><label>Transaction type</label><select id="type"><option value="expense">Expense / money out</option><option value="income">Customer payment / money in</option></select><label>Project</label><select id="project"><option value="">Select project</option>${db.projects.map(p=>`<option value="${esc(p.id)}">${esc(p.id)} — ${esc(p.name)}</option>`).join('')}</select><label>Date</label><input id="date" type="date" value="${today()}"><label>Amount (Birr)</label><input id="amount" type="number" min="0" step="0.01" placeholder="0"><label>Category</label><select id="category"></select><label>Description</label><textarea id="desc" rows="2" placeholder="What was this money for?"></textarea><label>Paid to / received from</label><input id="paid" placeholder="Name or company"><label>Payment method</label><select id="method"><option>Cash</option><option>Bank Transfer</option><option>Mobile Money</option><option>Card</option><option>Other</option></select><button class="btn" id="saveTx">Save transaction</button></div></div>`}function newProject(p){p=p||{};const e=!!p.id,v=k=>esc(p[k]==null?'':p[k]),n=k=>+p[k]?esc(p[k]):'';return `<div class="content"><h2>${e?'Edit project':'New project'}</h2><div class="panel"><label>Project ID</label><input id="pid" placeholder="HAY-001" value="${v('id')}" ${e?'readonly':''}>${e?'<div class="small">Project ID cannot be changed because transactions are linked to it.</div>':''}<label>Customer</label><input id="customer" value="${v('customer')}"><label>Project name</label><input id="pname" value="${v('name')}"><label>Quotation number</label><input id="quoteNo" value="${v('quoteNo')}"><label>Quoted price (Birr)</label><input id="quote" type="number" inputmode="decimal" value="${n('quote')}"><label>Expected cost (Birr)</label><input id="expected" type="number" inputmode="decimal" value="${n('expected')}"><label>Advance received (Birr)</label><input id="advance" type="number" inputmode="decimal" value="${n('advance')}"><div class="small">Recorded automatically as a customer payment in the project ledger.</div><label>Start date</label><input id="start" type="date" value="${v('start')}"><label>Deadline</label><input id="deadline" type="date" value="${v('deadline')}"><label>Notes</label><textarea id="notes" rows="3" placeholder="Anything to remember about this project">${v('notes')}</textarea><button class="btn" id="saveProject">${e?'Save changes':'Create project'}</button><button class="btn secondary" id="cancelProject">Cancel</button></div></div>`}function ledger(id){let p=db.projects.find(x=>x.id===id);if(!p)return '<div class="content">Project not found.</div>';let tx=db.transactions.filter(x=>x.projectId===id).sort((a,b)=>(b.date||'').localeCompare(a.date||'')),i=tx.filter(x=>x.type==='income').reduce((a,x)=>a+x.amount,0),o=tx.filter(x=>x.type==='expense').reduce((a,x)=>a+x.amount,0);return `<div class="content"><button class="btn secondary" data-go="projects">← Projects</button><button class="btn secondary" data-edit="${esc(p.id)}">✎ Edit project</button><h2>${esc(p.name)}</h2><div class="panel"><div class="statline"><span>Quoted price</span><b>${money(p.quote)}</b></div>${+p.advance>0?`<div class="statline"><span>Advance received</span><b>${money(p.advance)}</b></div>`:''}${p.start?`<div class="statline"><span>Start date</span><b>${esc(p.start)}</b></div>`:''}${p.deadline?`<div class="statline"><span>Deadline</span><b>${esc(p.deadline)}</b></div>`:''}${p.notes?`<div class="statline"><span>Notes</span><b style="text-align:right;font-weight:500">${esc(p.notes)}</b></div>`:''}<div class="statline"><span>Customer payments</span><b class="income">${money(i)}</b></div><div class="statline"><span>Expenses</span><b class="expense">${money(o)}</b></div><div class="statline"><span>Cash movement</span><b>${money(i-o)}</b></div><div class="statline"><span>Est. profit before overhead</span><b>${money((p.quote||0)-o)}</b></div><div class="statline"><span>Customer balance</span><b>${money((p.quote||0)-i)}</b></div></div><div class="panel"><h3>Transactions</h3>${tx.length?tx.map(x=>`<div class="item"><b class="${x.type}">${x.type==='income'?'+':'−'} ${money(x.amount)}</b><div>${esc(x.category)} — ${esc(x.description)}</div><div class="muted">${esc(x.date)} · ${esc(x.paidTo)}</div><button class="btn secondary" data-txedit="${esc(x.id)}">✎ Edit transaction</button><button class="btn danger" data-txdelete="${esc(x.id)}">Delete transaction</button></div>`).join(''):'<div class="empty">No transactions.</div>'}</div></div>`}function plan(){return `<div class="content"><h2>Master Plan · 2019 E.C.</h2><div class="hero"><div class="small">CORE THEME</div><div class="big">Build the Man. Build the Business. Build the Life.</div></div><div class="panel"><h3>Annual targets from your plan</h3><div class="statline"><span>Personal savings</span><b>1,500,000 Birr</b></div><div class="statline"><span>Starting savings</span><b>20,000 Birr</b></div><div class="statline"><span>Haymani net profit</span><b>2,500,000 Birr</b></div><div class="statline"><span>Body goal</span><b>52 kg → 65 kg</b></div><div class="statline"><span>Skill priority</span><b>Sales → Communication → Management</b></div></div><div class="panel"><h3>Daily operating system</h3><ul><li>Choose your daily Top 3: revenue, business execution, personal development.</li><li>Protect one hour for development: 30 min learning, 20 min practice, 10 min application/review.</li><li>Use a 5-minute start, phone away, creation before consumption, and no-zero-days.</li><li>Set an owner, deadline and next action for every important task.</li></ul><button class="btn" data-go="daily">Record today's Top 3</button></div><div class="panel"><h3>Weekly scorecard targets</h3>${[['Prospects',50],['Meaningful conversations',20],['Quotations',10],['Serious follow-ups',5],['Relationship-building meetings',1],['Major content pieces',3],['Gym sessions',4],['Weekly reviews',1],['CEO/system improvements',1]].map(([k,v])=>`<div class="statline"><span>${k}</span><b>${v} / week</b></div>`).join('')}</div><div class="panel"><h3>12-month profit roadmap</h3>${[75000,100000,125000,150000,180000,220000,230000,250000,270000,280000,300000,320000].map((v,i)=>`<div class="statline"><span>Month ${i+1}</span><b>${money(v)}</b></div>`).join('')}</div><div class="panel"><h3>Master Plan document</h3><p class="small">Keep the original Parts I–XIII document with the app package as your strategic reference.</p><a class="doclink" href="master-plan.docx" download>⇩ Open / download Master Plan (DOCX)</a></div></div>`}function control(){return `<div class="content"><h2>Control Center</h2><div class="panel"><h3>Workbook integration</h3><p class="small">This section brings your control workbook into the app's navigation. The original Excel file is included for detailed editing and preserving all original formulas.</p><a class="doclink" href="control-workbook.xlsx" download>⇩ Download Control Workbook (XLSX)</a></div><div class="panel"><h3>Personal savings tracker</h3><label>Current savings (Birr)</label><input id="savingsActual" type="number" placeholder="Enter actual savings"><label>Monthly new savings (Birr)</label><input id="savingsMonth" type="number" placeholder="Enter this month's savings"><button class="btn" id="saveSavings">Save savings snapshot</button><div id="savingsResult" class="small"></div></div><div class="panel"><h3>Weekly scorecard</h3><label>Prospects contacted</label><input id="prospects" type="number" value="0"><label>Meaningful conversations</label><input id="conversations" type="number" value="0"><label>Quotations sent</label><input id="quotes" type="number" value="0"><label>Serious follow-ups</label><input id="followups" type="number" value="0"><label>Major content pieces published</label><input id="posts" type="number" value="0"><button class="btn" id="saveScore">Save weekly scorecard</button><div id="scoreResult" class="small"></div></div><div class="panel"><h3>Daily Top 3</h3><label>Revenue task</label><input id="taskRevenue" placeholder="Today's revenue-producing action"><label>Business task</label><input id="taskBusiness" placeholder="Business execution task"><label>Personal development task</label><input id="taskPersonal" placeholder="Learning / health / personal task"><button class="btn" id="saveTop3">Save today's Top 3</button><div id="top3Result" class="small"></div></div><div class="panel"><h3>Other workbook trackers</h3><div class="statline"><span>Sales pipeline, quotations, receivables</span><b>Original workbook</b></div><div class="statline"><span>Production board and content tracker</span><b>Original workbook</b></div><div class="statline"><span>Skills, delegation and fitness</span><b>Original workbook</b></div><p class="small">The downloadable workbook remains the full source for these detailed sheets. The app's core interactive trackers can be expanded in the next build.</p></div></div>`}function reports(){let by={};db.transactions.filter(x=>x.type==='expense').forEach(x=>by[x.category]=(by[x.category]||0)+x.amount);return `<div class="content"><h2>Reports</h2><div class="panel"><h3>Expenses by category</h3>${Object.keys(by).length?Object.entries(by).sort((a,b)=>b[1]-a[1]).map(([k,v])=>`<div class="statline"><span>${esc(k)}</span><b>${money(v)}</b></div>`).join(''):'<div class="empty">No expenses yet.</div>'}</div><div class="panel"><h3>Project cash position</h3>${db.projects.map(p=>{let t=db.transactions.filter(x=>x.projectId===p.id),i=t.filter(x=>x.type==='income').reduce((a,x)=>a+x.amount,0),o=t.filter(x=>x.type==='expense').reduce((a,x)=>a+x.amount,0);return `<div class="statline"><span>${esc(p.name)}</span><b>${money(i-o)}</b></div>`}).join('')||'<div class="empty">No projects yet.</div>'}<button class="btn" id="exportCsv">Export transactions CSV</button></div></div>`}function bind(s){document.querySelectorAll('[data-go]').forEach(b=>b.onclick=()=>b.dataset.go==='newproject'?renderNew():b.dataset.go==='daily'?renderDaily():render(b.dataset.go));document.querySelectorAll('[data-ledger]').forEach(b=>b.onclick=()=>{let id=b.dataset.ledger;curLedger=id;$('#screen').innerHTML=ledger(id);bind('ledger')});document.querySelectorAll('[data-edit]').forEach(b=>b.onclick=()=>renderNew(b.dataset.edit,s));document.querySelectorAll('[data-txedit]').forEach(b=>b.onclick=()=>renderTxEdit(b.dataset.txedit));document.querySelectorAll('[data-delete]').forEach(b=>b.onclick=()=>{if(confirm('Delete this project and its transactions?')){db.projects=db.projects.filter(p=>p.id!==b.dataset.delete);db.transactions=db.transactions.filter(x=>x.projectId!==b.dataset.delete);save();render('projects')}});document.querySelectorAll('[data-txdelete]').forEach(b=>b.onclick=()=>{if(confirm('Delete this transaction?')){let dt=db.transactions.find(x=>x.id===b.dataset.txdelete);if(dt&&dt.isAdvance){let dp=db.projects.find(p=>p.id===dt.projectId);if(dp)dp.advance=0}db.transactions=db.transactions.filter(x=>x.id!==b.dataset.txdelete);save();$('#screen').innerHTML=ledger(curLedger);bind('ledger')}});if(s==='add'){$('#saveTx').onclick=saveTx;$('#type').onchange=fillCats;fillCats()}if(s==='control'){showLast();let a=$('#saveSavings');if(a)a.onclick=()=>{db.savings={actual:Number($('#savingsActual').value)||0,month:Number($('#savingsMonth').value)||0,date:today()};save();$('#savingsResult').textContent=`Saved. Current savings: ${money(db.savings.actual)}. Gap to target: ${money(1500000-db.savings.actual)}.`};let w=$('#saveScore');if(w)w.onclick=()=>{let o={date:today(),prospects:+$('#prospects').value||0,conversations:+$('#conversations').value||0,quotes:+$('#quotes').value||0,followups:+$('#followups').value||0,posts:+$('#posts').value||0};db.weeklyScorecard.push(o);save();$('#scoreResult').textContent=`Saved. Prospects ${o.prospects}/50 · conversations ${o.conversations}/20 · quotes ${o.quotes}/10 · follow-ups ${o.followups}/5 · posts ${o.posts}/3.`};let t=$('#saveTop3');if(t)t.onclick=()=>{db.dailyTop3.push({date:today(),revenue:$('#taskRevenue').value,business:$('#taskBusiness').value,personal:$('#taskPersonal').value});save();$('#top3Result').textContent='Top 3 saved for today.'}}if(s==='reports'&&$('#exportCsv'))$('#exportCsv').onclick=exportCsv}function showLast(){let s=db.savings,w=db.weeklyScorecard[db.weeklyScorecard.length-1],t=db.dailyTop3[db.dailyTop3.length-1];if(s)$('#savingsResult').textContent=`Last snapshot (${s.date}): ${money(s.actual)} saved. Gap to target: ${money(1500000-s.actual)}.`;if(w)$('#scoreResult').textContent=`Last scorecard (${w.date}): prospects ${w.prospects}/50 · conversations ${w.conversations}/20 · quotes ${w.quotes}/10 · follow-ups ${w.followups}/5 · posts ${w.posts}/3.`;if(t)$('#top3Result').textContent=`Last Top 3 (${t.date}): ${[t.revenue,t.business,t.personal].filter(Boolean).join(' · ')}`}function renderNew(eid,from){
+  let ex=eid?db.projects.find(p=>p.id===eid):null;
+  const back=()=>{if(ex&&from==='ledger'){curLedger=ex.id;$('#screen').innerHTML=ledger(ex.id);bind('ledger')}else render('projects')};
+  $('#screen').innerHTML=newProject(ex||{start:today()});
+  $('#cancelProject').onclick=back;
+  $('#saveProject').onclick=()=>{
+    let id=ex?ex.id:$('#pid').value.trim(),name=$('#pname').value.trim();
+    if(!id||!name){toast('Project ID and name are required');return}
+    if(!ex&&db.projects.some(p=>p.id===id)){toast('Project ID already exists');return}
+    let o={id,customer:$('#customer').value.trim(),name,quoteNo:$('#quoteNo').value.trim(),quote:+$('#quote').value||0,expected:+$('#expected').value||0,advance:Math.max(0,+$('#advance').value||0),start:$('#start').value,deadline:$('#deadline').value,notes:$('#notes').value.trim()};
+    let p;if(ex){Object.assign(ex,o);p=ex;db.transactions.forEach(t=>{if(t.projectId===id)t.projectName=name})}else{db.projects.push(o);p=o}
+    syncAdvance(p);save();toast(ex?'Project updated':'Project created');back();
   }
-  if (p === 'projects') {
-    h = `<div class="row"><h2>Projects</h2><button class="secondary" style="width:auto;padding:10px 16px" onclick="projectForm()">＋ New</button></div>` +
-      (d.projects.slice().reverse().map(x => {
-        const s = stats(x);
-        return `<div class="card"><div class="row"><div><b>${esc(x.id)}</b><div>${esc(x.name)}</div><small>${esc(x.customer)}${x.deadline ? ' · Due ' + esc(x.deadline) : ''}</small></div><span class="badge">${esc(x.status)}</span></div>
-          <p>Quoted: ${money(x.price)} · Spent: ${money(s.spent)}<br>Customer balance: ${money(s.balance)}</p>
-          <button class="secondary" onclick="openLedger(${jsArg(x.id)})">Open Ledger</button>
-          <button class="secondary" onclick="tx('expense',${jsArg(x.id)})">＋ Expense</button>
-          <button class="secondary" onclick="tx('income',${jsArg(x.id)})">＋ Customer Payment</button>
-          <button class="secondary" onclick="projectForm(${jsArg(x.id)})">Edit Project</button></div>`;
-      }).join('') || '<p class="muted">No projects yet.</p>');
-  }
-  if (p === 'ledger') {
-    if (!d.projects.some(x => x.id === ledgerId)) ledgerId = d.projects.length ? d.projects[0].id : null;
-    const opts = d.projects.map(x => `<option value="${esc(x.id)}" ${x.id === ledgerId ? 'selected' : ''}>${esc(x.id)} — ${esc(x.name)}</option>`).join('');
-    h = `<h2>Project Ledger</h2>` + (ledgerId === null ? '<p class="muted">No projects yet.</p>' :
-      `<select onchange="openLedger(this.value)">${opts}</select><div id="ll">${ledgerHtml(ledgerId)}</div>`);
-  }
-  if (p === 'reports') {
-    const tq = sum(d.projects.map(x => ({amount: x.price}))), ts = exp;
-    h = `<h2>Reports</h2><div class="grid"><div class="card"><small>Total Quoted</small><b>${money(tq)}</b></div><div class="card"><small>Total Spent</small><b>${money(ts)}</b></div></div>` +
-      (d.projects.map(x => {
-        const s = stats(x);
-        return `<div class="card"><div class="row"><b>${esc(x.id)} — ${esc(x.name)}</b><span class="badge">${esc(x.status)}</span></div>
-          <p>Quoted: ${money(x.price)}<br>Expected cost: ${money(x.expectedCost)}<br>Expected profit: ${money(s.expectedProfit)}</p>
-          <p>Actual cost: ${money(s.spent)} (${pct(s.costPct)} of quote)<br>Current estimated profit: <b class="${s.currentProfit < 0 ? 'expense' : 'income'}">${money(s.currentProfit)}</b></p>
-          <p>Advance: ${money(x.advance)}<br>Payments logged: ${money(s.paid)}<br>Customer balance: ${money(s.balance)}<br>Net cash: ${money(s.netCash)}</p></div>`;
-      }).join('') || '<p class="muted">No projects.</p>');
-  }
-  if (p === 'data') {
-    h = `<h2>Backup &amp; Data</h2><div class="card"><p class="muted">Data is stored locally on this iPhone. Export a backup regularly.</p>
-      <button class="btn" onclick="backup()">Export Backup</button>
-      <label class="secondary" style="display:block;text-align:center">Import Backup<input type="file" accept=".json,application/json" onchange="imp(event)" style="display:none"></label>
-      <button class="danger" onclick="wipe()">Delete All Data</button></div>
-      <div class="card"><b>Haymani Project Money v2</b><p class="muted">Works offline once opened online one time. Designed for iPhone 8 Plus / iOS 16.</p></div>`;
-  }
-  $('#app').innerHTML = h;
 }
-
-function ledgerHtml(id) {
-  const ts = d.transactions.filter(t => t.projectId === id).slice().reverse();
-  return `<div class="grid"><div class="card">Income<br><b>${money(total(id, 'income'))}</b></div><div class="card">Expense<br><b>${money(total(id, 'expense'))}</b></div></div>` +
-    (ts.map(t => row(t, true)).join('') || '<p class="muted">No transactions.</p>');
+const CATS={expense:['Material','Hardware','Labor','Transport','Installation','Finishing','Outsourcing','CNC-Machine','Fuel','Food-Allowance','Miscellaneous','Refund','Other'],income:['Customer Payment','Refund','Other']};function fillCats(){$('#category').innerHTML=CATS[$('#type').value].map(x=>`<option>${x}</option>`).join('')}function renderTxEdit(id){
+  let t=db.transactions.find(x=>x.id===id);if(!t)return;
+  $('#screen').innerHTML=add();bind('add');
+  editTxId=id;
+  const opt=(sel,val)=>{if(val&&![...sel.options].some(o=>o.value===val||o.textContent===val))sel.add(new Option(val,val));sel.value=val};
+  $('#screen h2').textContent='Edit transaction';
+  $('#type').value=t.type;fillCats();
+  $('#project').value=t.projectId;$('#date').value=t.date||today();$('#amount').value=t.amount;
+  opt($('#category'),t.category);opt($('#method'),t.method||'Cash');
+  $('#desc').value=t.description||'';$('#paid').value=t.paidTo||'';
+  if(t.isAdvance){$('#type').disabled=true;$('#project').disabled=true;$('#saveTx').insertAdjacentHTML('beforebegin','<div class="small">This is the project\'s advance payment. Changing the amount here also updates the advance on the project.</div>')}
+  $('#saveTx').textContent='Save changes';
+  $('#saveTx').insertAdjacentHTML('afterend','<button class="btn secondary" id="cancelTx">Cancel</button>');
+  $('#cancelTx').onclick=()=>{editTxId=null;curLedger=t.projectId;$('#screen').innerHTML=ledger(t.projectId);bind('ledger')};
 }
-function openLedger(id) { ledgerId = id; page('ledger'); }
-
-/* ---------- forms ---------- */
-function modal(html) {
-  const m = document.createElement('div');
-  m.className = 'modal';
-  m.innerHTML = '<div><button class="close" onclick="this.closest(\'.modal\').remove()">×</button>' + html + '</div>';
-  document.body.appendChild(m);
-}
-const closeModal = () => { const m = document.querySelector('.modal'); if (m) m.remove(); };
-const opts = (list, sel) => list.map(x => `<option ${x === sel ? 'selected' : ''}>${esc(x)}</option>`).join('');
-
-function projectForm(eid) {
-  const p = eid ? d.projects.find(x => x.id === eid) : { id: '', customer: '', name: '', quote: '', price: '', expectedCost: '', advance: '', start: today(), deadline: '', status: 'Planned', notes: '' };
-  modal(`<h2>${eid ? 'Edit Project' : 'New Project'}</h2>
-    <label>Project ID *</label><input id="pid" value="${esc(p.id)}" ${eid ? 'readonly' : ''}>
-    <label>Customer *</label><input id="cu" value="${esc(p.customer)}">
-    <label>Project Name *</label><input id="pn" value="${esc(p.name)}">
-    <label>Quotation No.</label><input id="qn" value="${esc(p.quote)}">
-    <label>Quoted Price (Birr)</label><input id="qp" type="number" inputmode="decimal" value="${esc(p.price || '')}">
-    <label>Expected Cost (Birr)</label><input id="ec" type="number" inputmode="decimal" value="${esc(p.expectedCost || '')}">
-    <label>Advance Received (Birr)</label><input id="ad" type="number" inputmode="decimal" value="${esc(p.advance || '')}">
-    <label>Start Date</label><input id="sd" type="date" value="${esc(p.start)}">
-    <label>Deadline</label><input id="dl" type="date" value="${esc(p.deadline)}">
-    <label>Status</label><select id="st">${opts(STATUSES, p.status)}</select>
-    <label>Notes</label><textarea id="nt" rows="3">${esc(p.notes)}</textarea>
-    <button class="btn" onclick="saveProject(${jsArg(eid || '')})">Save Project</button>`);
-}
-function saveProject(eid) {
-  const v = id => $('#' + id).value.trim();
-  const p = { id: v('pid'), customer: v('cu'), name: v('pn'), quote: v('qn'), price: +v('qp') || 0, expectedCost: +v('ec') || 0,
-              advance: +v('ad') || 0, start: v('sd'), deadline: v('dl'), status: $('#st').value, notes: v('nt') };
-  if (!p.id || !p.customer || !p.name) return alert('Project ID, Customer and Project Name are required.');
-  if (eid) { d.projects[d.projects.findIndex(x => x.id === eid)] = p; }
-  else {
-    if (d.projects.some(x => x.id === p.id)) return alert('Project ID already exists.');
-    d.projects.push(p);
-  }
-  closeModal(); save();
-}
-
-function tx(type, pid) {
-  if (!d.projects.length) return alert('Create a project first.');
-  const o = d.projects.map(x => `<option value="${esc(x.id)}" ${x.id === pid ? 'selected' : ''}>${esc(x.id)} — ${esc(x.name)}</option>`).join('');
-  modal(`<h2>${type === 'income' ? 'Customer Payment' : 'Add Expense'}</h2>
-    <label>Project *</label><select id="tp">${o}</select>
-    <label>Date</label><input id="td" type="date" value="${today()}">
-    <label>Amount (Birr) *</label><input id="ta" type="number" inputmode="decimal">
-    <label>Category</label><select id="tc">${opts(type === 'income' ? INCOME_CATS : EXPENSE_CATS)}</select>
-    <label>Description *</label><input id="txd">
-    <label>${type === 'income' ? 'Received From' : 'Paid To'}</label><input id="person">
-    <label>Payment Method</label><select id="tm">${opts(METHODS)}</select>
-    <label>Receipt / Reference</label><input id="ref">
-    <label>Recorded By</label><input id="by">
-    <label>Notes</label><input id="tn">
-    <button class="btn" onclick="addTx('${type}')">Save</button>`);
-}
-function addTx(type) {
-  const t = { uid: uid(), projectId: $('#tp').value, date: $('#td').value, amount: +$('#ta').value || 0, category: $('#tc').value,
-              description: $('#txd').value.trim(), person: $('#person').value.trim(), method: $('#tm').value,
-              ref: $('#ref').value.trim(), by: $('#by').value.trim(), notes: $('#tn').value.trim(), type };
-  if (t.amount <= 0 || !t.description) return alert('Amount and Description are required.');
-  d.transactions.push(t);
-  closeModal(); save();
-}
-function delTx(id) {
-  if (!confirm('Delete this transaction?')) return;
-  d.transactions = d.transactions.filter(t => t.uid !== id);
-  save();
-}
-
-/* ---------- backup ---------- */
-function backup() {
-  const b = new Blob([JSON.stringify(d, null, 2)], { type: 'application/json' }), a = document.createElement('a');
-  a.href = URL.createObjectURL(b);
-  a.download = 'Haymani_Backup_' + today() + '.json';
-  document.body.appendChild(a); a.click(); a.remove();
-}
-function imp(e) {
-  const f = e.target.files[0]; if (!f) return;
-  const r = new FileReader();
-  r.onload = () => {
-    try {
-      const x = JSON.parse(r.result);
-      if (!Array.isArray(x.projects) || !Array.isArray(x.transactions)) throw 0;
-      if (!confirm('Replace current data with this backup?')) return;
-      d = normalize(x); save(); alert('Backup imported.');
-    } catch { alert('Invalid backup.'); }
-  };
-  r.readAsText(f); e.target.value = '';
-}
-function wipe() {
-  if (confirm('Delete ALL data? This cannot be undone.')) { d = { projects: [], transactions: [] }; save(); }
-}
-
-/* ---------- start ---------- */
-page('home');
-if (navigator.storage && navigator.storage.persist) navigator.storage.persist();
-if ('serviceWorker' in navigator) addEventListener('load', () => navigator.serviceWorker.register('sw.js').catch(() => {}));
+function saveTx(){let id=$('#project').value,amount=+$('#amount').value;if(!id){toast('Select a project');return}if(!(amount>0)){toast('Enter an amount greater than zero');return}let p=db.projects.find(p=>p.id===id),type=$('#type').value;
+if(editTxId){let t=db.transactions.find(x=>x.id===editTxId);if(t){Object.assign(t,{date:$('#date').value,projectId:id,projectName:p.name,type,category:$('#category').value,amount,description:$('#desc').value.trim(),paidTo:$('#paid').value.trim(),method:$('#method').value});if(t.isAdvance)p.advance=amount;editTxId=null;curLedger=id;save();toast('Transaction updated');$('#screen').innerHTML=ledger(id);bind('ledger');return}editTxId=null}
+db.transactions.push({id:Date.now().toString(),date:$('#date').value,projectId:id,projectName:p.name,type,category:$('#category').value,amount,description:$('#desc').value.trim(),paidTo:$('#paid').value.trim(),method:$('#method').value});save();toast('Transaction saved');render('dashboard')}function renderDaily(){ $('#screen').innerHTML=`<div class="content"><h2>Today's Top 3</h2><div class="panel"><label>Revenue task</label><input id="taskRevenue"><label>Business task</label><input id="taskBusiness"><label>Personal development task</label><input id="taskPersonal"><button class="btn" id="saveTop3">Save Top 3</button></div></div>`;$('#saveTop3').onclick=()=>{db.dailyTop3.push({date:today(),revenue:$('#taskRevenue').value,business:$('#taskBusiness').value,personal:$('#taskPersonal').value});save();toast('Top 3 saved');render('plan')}}function exportCsv(){let rows=[['Date','Project ID','Project','Type','Category','Description','Amount','Method','Paid to'],...db.transactions.map(x=>[x.date,x.projectId,x.projectName,x.type,x.category,x.description,x.amount,x.method,x.paidTo])];let csv=rows.map(r=>r.map(v=>'"'+String(v??'').replace(/"/g,'""')+'"').join(',')).join('\r\n'),blob=new Blob(['\ufeff'+csv],{type:'text/csv;charset=utf-8;'}),a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='haymani-transactions-'+today()+'.csv';document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(a.href),1500)}$('#backupBtn').onclick=()=>{let blob=new Blob([JSON.stringify(db,null,2)],{type:'application/json'}),a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='haymani-backup-'+today()+'.json';document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(a.href),1500)};$('#restoreBtn').onclick=()=>$('#restoreFile').click();$('#restoreFile').onchange=e=>{let f=e.target.files[0];if(!f)return;let r=new FileReader();r.onload=()=>{try{let x=JSON.parse(r.result);if(!x||!Array.isArray(x.projects)||!Array.isArray(x.transactions))throw 0;if(!confirm('Replace ALL current data with this backup?'))return;db=fixDb(x);save();render('dashboard');toast('Backup restored')}catch(err){toast('Invalid backup file')}};r.readAsText(f);e.target.value=''};if('serviceWorker'in navigator)navigator.serviceWorker.register('sw.js').catch(()=>{});render('dashboard');
