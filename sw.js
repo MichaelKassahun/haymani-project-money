@@ -1,4 +1,4 @@
-const CACHE='haymani-os-v5';
+const CACHE='haymani-os-v7';
 const CORE=['./','./index.html','./styles.css','./app.js','./manifest.webmanifest','./haymani-logo.png','./icon-180.png','./icon-512.png'];
 const DOCS=['./master-plan.docx','./control-workbook.xlsx'];
 self.addEventListener('install',e=>e.waitUntil(caches.open(CACHE).then(async c=>{await c.addAll(CORE);await Promise.all(DOCS.map(u=>c.add(u).catch(()=>{})))}).then(()=>self.skipWaiting())));
